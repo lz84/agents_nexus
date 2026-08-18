@@ -1,0 +1,318 @@
+# ============================================================
+# CI Pipeline — Grever (Nexus)
+# Triggered on: push/PR to main
+# Jobs: lint → test (backend + frontend) → build
+# ============================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "20"
+
+# Cancel outdated runs on same branch
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -----------------------------------------------------------
+  # 1. Lint & Typecheck (fast feedback, parallel)
+  # -----------------------------------------------------------
+  lint-and-typecheck:
+    name: Lint & Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('config/requirements.txt', 'config/requirements-dev.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install Python lint deps
+        run: pip install ruff && pip install -r config/requirements-dev.txt
+
+      - name: Ruff lint (fail on violation)
+        working-directory: packages/server
+        run: ruff check src/ tests/
+
+      - name: Ruff format check
+        working-directory: packages/server
+        run: ruff format --check src/ tests/
+
+      # Node.js
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: packages/ui/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: packages/ui
+        run: npm ci
+
+      - name: TypeScript type check
+        working-directory: packages/ui
+        run: npx tsc --noEmit
+
+  # -----------------------------------------------------------
+  # 2. Backend Tests (Python/pytest)
+  # -----------------------------------------------------------
+  backend-tests:
+    name: Backend Tests (pytest)
+    runs-on: ubuntu-latest
+    needs: lint-and-typecheck
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('config/requirements.txt', 'config/requirements-dev.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: |
+          pip install -r config/requirements-dev.txt
+          pip install pytest-asyncio pytest-cov
+
+      - name: Create test DB dir
+        run: mkdir -p packages/server/data
+
+      - name: Run pytest
+        working-directory: packages/server
+        env:
+          GREVER_ENV: test
+          DATABASE_URL: sqlite:///../../data/reins.db
+        run: pytest tests/ -v --tb=short -m "not slow" \
+          --cov=src --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage XML
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: packages/server/coverage.xml
+          retention-days: 7
+
+      - name: Upload test logs on failure
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: pytest-logs
+          path: packages/server/data/
+          retention-days: 14
+
+  # -----------------------------------------------------------
+  # 3. Frontend Tests (Vitest)
+  # -----------------------------------------------------------
+  frontend-tests:
+    name: Frontend Tests (Vitest)
+    runs-on: ubuntu-latest
+    needs: lint-and-typecheck
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: packages/ui/package-lock.json
+
+      - name: Install deps
+        working-directory: packages/ui
+        run: npm ci
+
+      - name: Run Vitest
+        working-directory: packages/ui
+        run: npx vitest run --reporter=verbose
+
+      - name: Upload test logs on failure
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: vitest-logs
+          path: packages/ui/coverage/
+          retention-days: 14
+
+  # -----------------------------------------------------------
+  # 4. Frontend Build (gates merge)
+  # -----------------------------------------------------------
+  build-frontend:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    needs: [backend-tests, frontend-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: packages/ui/package-lock.json
+
+      - name: Install deps
+        working-directory: packages/ui
+        run: npm ci
+
+      - name: Build
+        working-directory: packages/ui
+        run: npm run build
+
+      - name: Verify build output
+        working-directory: packages/ui
+        run: |
+          test -d dist || { echo "BUILD FAIL: dist/ not found"; exit 1; }
+          count=$(find dist -type f | wc -l)
+          echo "Build OK: $count files in dist/"
+          [ "$count" -gt 0 ] || exit 1
+
+  # -----------------------------------------------------------
+  # 5. Test Result Notification (always runs, reports summary)
+  # -----------------------------------------------------------
+  notify-results:
+    name: Test Result Notification
+    runs-on: ubuntu-latest
+    needs: [lint-and-typecheck, backend-tests, frontend-tests, build-frontend]
+    if: always()
+    steps:
+      # Collect job results into a summary
+      - name: Generate CI Summary
+        run: |
+          LINT_STATUS="${{ needs.lint-and-typecheck.result }}"
+          BACKEND_STATUS="${{ needs.backend-tests.result }}"
+          FRONTEND_STATUS="${{ needs.frontend-tests.result }}"
+          BUILD_STATUS="${{ needs.build-frontend.result }}"
+
+          # Determine overall status
+          if [[ "$LINT_STATUS" == "success" && "$BACKEND_STATUS" == "success" && "$FRONTEND_STATUS" == "success" && "$BUILD_STATUS" == "success" ]]; then
+            OVERALL="✅ PASSED"
+          else
+            OVERALL="❌ FAILED"
+          fi
+
+          echo "### CI Pipeline Result: $OVERALL" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint & Typecheck | $LINT_STATUS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend Tests | $BACKEND_STATUS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend Tests | $FRONTEND_STATUS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend Build | $BUILD_STATUS |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+
+          # Also output to console for logs
+          echo "CI Result: $OVERALL"
+          echo "  Lint: $LINT_STATUS"
+          echo "  Backend: $BACKEND_STATUS"
+          echo "  Frontend: $FRONTEND_STATUS"
+          echo "  Build: $BUILD_STATUS"
+
+      # Download test artifacts for summary (on failure)
+      - name: Download test artifacts
+        if: failure() || cancelled()
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: List artifacts on failure
+        if: failure() || cancelled()
+        run: |
+          echo "--- Test Artifacts ---"
+          find artifacts/ -type f -name "*.xml" -o -name "*.log" 2>/dev/null | head -20
+
+      # Webhook notification (optional — requires FEISHU_WEBHOOK_URL secret)
+      - name: Send Feishu notification
+        if: always() && secrets.FEISHU_WEBHOOK_URL != ''
+        run: |
+          LINT_STATUS="${{ needs.lint-and-typecheck.result }}"
+          BACKEND_STATUS="${{ needs.backend-tests.result }}"
+          FRONTEND_STATUS="${{ needs.frontend-tests.result }}"
+          BUILD_STATUS="${{ needs.build-frontend.result }}"
+
+          if [[ "$LINT_STATUS" == "success" && "$BACKEND_STATUS" == "success" && "$FRONTEND_STATUS" == "success" && "$BUILD_STATUS" == "success" ]]; then
+            STATUS_EMOJI="✅"
+            STATUS_TEXT="PASSED"
+            COLOR="green"
+          else
+            STATUS_EMOJI="❌"
+            STATUS_TEXT="FAILED"
+            COLOR="red"
+          fi
+
+          # Build Feishu rich message card
+          PAYLOAD=$(cat <<EOF
+          {
+            "msg_type": "interactive",
+            "card": {
+              "header": {
+                "title": {
+                  "tag": "plain_text",
+                  "content": "$STATUS_EMOJI CI Pipeline $STATUS_TEXT — Grever"
+                },
+                "template": "$COLOR"
+              },
+              "elements": [
+                {
+                  "tag": "div",
+                  "text": {
+                    "content": "**Commit:** ${{ github.sha }}\n**Branch:** ${{ github.ref_name }}\n**Trigger:** ${{ github.event_name }}\n**Author:** ${{ github.actor }}",
+                    "tag": "lark_md"
+                  }
+                },
+                {
+                  "tag": "hr"
+                },
+                {
+                  "tag": "div",
+                  "text": {
+                    "content": "| Job | Status |\n|-----|--------|\n| Lint & Typecheck | $LINT_STATUS |\n| Backend Tests | $BACKEND_STATUS |\n| Frontend Tests | $FRONTEND_STATUS |\n| Frontend Build | $BUILD_STATUS |",
+                    "tag": "lark_md"
+                  }
+                },
+                {
+                  "tag": "action",
+                  "actions": [
+                    {
+                      "tag": "button",
+                      "text": {
+                        "content": "View CI Run",
+                        "tag": "plain_text"
+                      },
+                      "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                      "type": "primary"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+          EOF
+          )
+
+          curl -s -X POST "${{ secrets.FEISHU_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" > /dev/null
+
+          echo "Feishu notification sent ($STATUS_TEXT)"

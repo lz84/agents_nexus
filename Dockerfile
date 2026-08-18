@@ -1,61 +1,51 @@
-# Grever Production Deployment Dockerfile
-FROM python:3.11-slim
+# ============================================================
+# Grever Production Dockerfile
+# Multi-stage: frontend build → Python runtime
+# ============================================================
 
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV NODE_ENV=production
+# ---------- Stage 1: Build Frontend ----------
+FROM node:20-slim AS frontend-builder
 
-# Set work directory
-WORKDIR /app
-
-# Install system dependencies
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        curl \
-        supervisor \
-        nginx \
-        nodejs \
-        npm \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy project requirements
-COPY config/requirements.txt /app/packages/server/requirements.txt
-
-# Install Python dependencies
-RUN pip install --upgrade pip && pip install -r /app/packages/server/requirements.txt
-
-# Install Node.js dependencies for frontend
 WORKDIR /app/packages/ui
-COPY ./packages/ui/package*.json ./
-RUN npm ci --only=production
-
-# Copy project
-WORKDIR /app
-COPY . .
-
-# Build frontend
-WORKDIR /app/packages/ui
+COPY packages/ui/package*.json ./
+RUN npm ci
+COPY packages/ui/ .
 RUN npm run build
 
-# Setup database directory
+# ---------- Stage 2: Python Runtime ----------
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    GREVER_ENV=production
+
 WORKDIR /app
-RUN mkdir -p packages/server/data
-RUN touch packages/server/data/reins.db
 
-# Expose ports (backend runs on 8096, nginx on 80)
-EXPOSE 8096
-EXPOSE 80
+# System deps
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
 
-# Create supervisor and nginx config directories
-RUN mkdir -p /etc/supervisor/conf.d/ /etc/nginx/conf.d/ /var/log/nginx /var/run/nginx
+# Python deps
+COPY config/requirements.txt /tmp/requirements.txt
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt
 
-# Copy configuration files
-COPY docker/supervisord.conf /etc/supervisor/conf.d/nexus.conf
-COPY nginx/nginx.conf /etc/nginx/conf.d/default.conf
+# Application code
+COPY packages/server/src packages/server/src
+COPY config/ config/
+COPY migrations/ migrations/
 
-# Health check
+# Frontend build artifacts
+COPY --from=frontend-builder /app/packages/ui/dist packages/ui/dist
+
+# Data & logs dirs
+RUN mkdir -p /app/data /app/logs
+
+EXPOSE 8097
+
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD curl -f http://localhost:8096/ || exit 1
+    CMD curl -f http://localhost:8097/health || exit 1
 
-CMD ["supervisord", "-c", "/etc/supervisor/supervisord.conf"]
+CMD ["python", "-m", "uvicorn", "packages.server.src.reins.api.server:app", "--host", "0.0.0.0", "--port", "8097"]

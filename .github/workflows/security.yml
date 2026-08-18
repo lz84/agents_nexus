@@ -1,0 +1,118 @@
+# ============================================================
+# Security Scan — SAST + Dependency Check
+# Triggered on: push/PR to main, schedule (weekly)
+# ============================================================
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly scan every Monday at 02:00 UTC
+    - cron: "0 2 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  # -----------------------------------------------------------
+  # 1. Python SAST (Bandit)
+  # -----------------------------------------------------------
+  sast-python:
+    name: Python SAST (Bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Bandit
+        run: pip install bandit
+
+      - name: Run Bandit
+        working-directory: packages/server
+        run: bandit -r src/ -f sarif -o bandit.sarif || true
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: packages/server/bandit.sarif
+
+  # -----------------------------------------------------------
+  # 2. Python Dependency Audit (pip-audit)
+  # -----------------------------------------------------------
+  deps-python:
+    name: Python Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Audit requirements
+        run: pip-audit -r config/requirements.txt --format=columns
+
+  # -----------------------------------------------------------
+  # 3. Node.js Dependency Audit (npm audit)
+  # -----------------------------------------------------------
+  deps-nodejs:
+    name: Node.js Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: packages/ui/package-lock.json
+
+      - name: Install deps
+        working-directory: packages/ui
+        run: npm ci
+
+      - name: Run npm audit
+        working-directory: packages/ui
+        run: npm audit --production --audit-level=moderate
+
+  # -----------------------------------------------------------
+  # 4. Secret Scan (Gitleaks)
+  # -----------------------------------------------------------
+  secret-scan:
+    name: Secret Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # -----------------------------------------------------------
+  # 5. Dockerfile Lint (Hadolint)
+  # -----------------------------------------------------------
+  dockerfile-lint:
+    name: Dockerfile Lint (Hadolint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error

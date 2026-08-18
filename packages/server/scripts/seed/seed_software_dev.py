@@ -387,8 +387,8 @@ def seed_database(db_path: Path):
                             "status": task_status,
                             "priority": priority,
                             "verifier_agent_id": "agent-verifier-default",
-                            "created_at": now.isoformat(),
-                            "updated_at": now.isoformat(),
+                            "created_at": int(now.timestamp()),
+                            "updated_at": int(now.timestamp()),
                         }
                     )
                     total_tasks += 1

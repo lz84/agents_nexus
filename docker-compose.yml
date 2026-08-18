@@ -1,49 +1,39 @@
-version: '3.8'
+# ============================================================
+# Grever Docker Compose — Production Deployment
+# Usage: docker compose up -d
+# ============================================================
+version: "3.8"
 
 services:
-  grever:
+  grever-app:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: grever
+    container_name: grever-app
     ports:
-      - "80:80"
-      - "8096:8096"
+      - "${GREVER_PORT:-8097}:8097"
     volumes:
-      - ./data:/app/packages/server/data
-      - ./logs:/app/logs
-    env_file:
-      - .env
+      - grever-data:/app/data
+      - grever-logs:/app/logs
     environment:
-      - SQLITE_PATH=/app/packages/server/data/reins.db
-      - SQLALCHEMY_DATABASE_URL=sqlite:///app/packages/server/data/reins.db
-      - LOG_LEVEL=INFO
-      - ENVIRONMENT=production
+      - GREVER_ENV=production
+      - DATABASE_URL=sqlite:///app/data/reins.db
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - HERMES_API_URL=${HERMES_API_URL:-}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8096/"]
+      test: ["CMD", "curl", "-f", "http://localhost:8097/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
-    networks:
-      - grever-network
-
-  redis:
-    image: redis:alpine
-    container_name: grever-redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes
-    restart: unless-stopped
-    networks:
-      - grever-network
-
-networks:
-  grever-network:
-    driver: bridge
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2"
 
 volumes:
-  redis_data:
+  grever-data:
+  grever-logs:

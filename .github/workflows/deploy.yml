@@ -1,0 +1,92 @@
+# ============================================================
+# CD — Deploy to Production Server
+# Triggered on: successful Docker build (tag push)
+# Target: SSH to production server, pull image, restart
+# ============================================================
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: ["Docker"]
+    types: [completed]
+    branches: [main]
+
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [staging, production]
+        default: staging
+      image_tag:
+        description: "Docker image tag to deploy"
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  deploy:
+    name: Deploy to ${{ github.event.inputs.target_env || 'production' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.target_env || 'production' }}
+    steps:
+      - name: Resolve image tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            echo "tag=${{ github.event.inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.workflow_run.head_branch }}" ]; then
+            # Extract tag from workflow_run or use sha
+            echo "tag=sha-${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          script: |
+            set -e
+            IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}"
+            echo "Deploying $IMAGE..."
+
+            # Pull new image
+            docker pull "$IMAGE"
+
+            # Stop old containers
+            cd /opt/grever || mkdir -p /opt/grever && cd /opt/grever
+
+            # Update compose file image tag
+            sed -i "s|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:.*|image: $IMAGE|g" docker-compose.yml 2>/dev/null || true
+
+            # Restart services
+            docker compose down --remove-orphans || docker-compose down --remove-orphans || true
+            docker compose up -d || docker-compose up -d
+
+            # Health check
+            echo "Waiting for services to be healthy..."
+            for i in $(seq 1 30); do
+              if curl -sf http://localhost:8097/health >/dev/null 2>&1; then
+                echo "Backend is healthy!"
+                exit 0
+              fi
+              echo "Waiting... ($i/30)"
+              sleep 5
+            done
+            echo "ERROR: Backend failed health check after 150s"
+            docker compose logs --tail=50 || docker-compose logs --tail=50
+            exit 1
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Deployment failed for ${{ steps.tag.outputs.tag }}"
